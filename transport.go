@@ -61,7 +61,6 @@ func doJSON(ctx context.Context, hc *http.Client, botToken, base, method, path s
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("ilink: %s %s: unexpected status %s", method, path, resp.Status)
 	}
-
 	if dst != nil {
 		if err := json.NewDecoder(resp.Body).Decode(dst); err != nil {
 			return fmt.Errorf("ilink: %s %s: decode response: %w", method, path, err)
@@ -77,13 +76,11 @@ func putBytes(ctx context.Context, url string, data []byte) error {
 		return fmt.Errorf("ilink: put: %w", err)
 	}
 	req.ContentLength = int64(len(data))
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("ilink: put %s: %w", url, err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("ilink: put %s: unexpected status %s", url, resp.Status)
 	}

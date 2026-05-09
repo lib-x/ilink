@@ -18,10 +18,23 @@ const (
 type Item struct {
 	Type  ItemType
 	Text  *TextItem
-	Image *MediaItem
+	Image *ImageItem
 	Voice *VoiceItem
-	File  *MediaItem
+	File  *FileItem
 	Video *VideoItem
+
+	// RefMsg is set when this item quotes a previously sent message.
+	RefMsg *RefMessage
+
+	// MsgID is the per-item message ID, set on inbound items.
+	MsgID string
+
+	// CreateTimeMs is the item creation timestamp in milliseconds (inbound only).
+	CreateTimeMs int64
+	// UpdateTimeMs is the item last-update timestamp in milliseconds (inbound only).
+	UpdateTimeMs int64
+	// IsCompleted indicates the item content is fully delivered (inbound only).
+	IsCompleted bool
 }
 
 // TextMessage returns an [Item] containing a plain text payload.
@@ -31,52 +44,146 @@ func TextMessage(text string) Item {
 
 // TextItem holds a plain-text payload.
 type TextItem struct {
-	Text string `json:"text"`
+	Text string
 }
 
-// MediaItem describes a CDN-hosted, AES-128-ECB-encrypted media file.
-// Use [Client.UploadMedia] to produce one ready for sending.
-type MediaItem struct {
-	// FileName is the original file name, used for file attachments.
-	FileName string `json:"file_name,omitempty"`
-
-	FileSize      int64  `json:"file_size"`
-	FileMD5       string `json:"file_md5"`
-	EncryptedSize int64  `json:"encrypted_size"`
-
-	// AESKey is the base64-encoded 128-bit AES key used to encrypt the file.
-	AESKey string `json:"aes_key"`
-
-	// EncryptQueryParam is the CDN query string returned by getuploadurl,
-	// required when referencing this media in a message.
-	EncryptQueryParam string `json:"encrypt_query_param"`
+// CDNMedia is a CDN reference to an AES-128-ECB-encrypted media file.
+// It is embedded in [ImageItem], [VoiceItem], [FileItem], and [VideoItem].
+type CDNMedia struct {
+	// EncryptQueryParam is the encrypted CDN parameter string used to
+	// download or reference the file.
+	EncryptQueryParam string
+	// AESKey is the base64-encoded 128-bit AES key.
+	AESKey string
+	// EncryptType: 0 = encrypt fileid only; 1 = pack thumbnail/mid-size info.
+	EncryptType int
+	// FullURL is the complete download URL returned by the server (when present).
+	// If empty, construct the URL from EncryptQueryParam and the CDN base.
+	FullURL string
 }
 
-// VoiceItem is a voice message in Silk encoding, optionally with a transcript.
+// MediaItem is the legacy unified CDN reference kept for backwards compatibility
+// with [Client.UploadMedia]. New inbound messages use the richer per-type structs.
+//
+// Deprecated: use [CDNMedia] embedded in [ImageItem], [VoiceItem], etc.
+type MediaItem = CDNMedia
+
+// ImageItem is an image message with optional thumbnail.
+type ImageItem struct {
+	// Media is the CDN reference to the full-size image.
+	Media *CDNMedia
+	// ThumbMedia is the CDN reference to the thumbnail, if present.
+	ThumbMedia *CDNMedia
+
+	// AESKey is the raw hex AES-128 key (16 bytes) preferred for inbound
+	// decryption over Media.AESKey.
+	AESKey string
+	// URL is a direct image URL (when provided by the server).
+	URL string
+
+	// Dimensions of the thumbnail and high-def variants (pixels / bytes).
+	ThumbWidth  int
+	ThumbHeight int
+	ThumbSize   int
+	MidSize     int
+	HDSize      int
+}
+
+// VoiceEncodeType indicates the audio encoding of a voice message.
+type VoiceEncodeType int
+
+const (
+	VoiceEncodePCM      VoiceEncodeType = 1
+	VoiceEncodeADPCM    VoiceEncodeType = 2
+	VoiceEncodeFeature  VoiceEncodeType = 3
+	VoiceEncodeSpeex    VoiceEncodeType = 4
+	VoiceEncodeAMR      VoiceEncodeType = 5
+	VoiceEncodeSilk     VoiceEncodeType = 6
+	VoiceEncodeMP3      VoiceEncodeType = 7
+	VoiceEncodeOGGSpeex VoiceEncodeType = 8
+)
+
+// VoiceItem is a voice message.
 type VoiceItem struct {
-	MediaItem
-	DurationMs  int    `json:"duration_ms"`
-	RecognText  string `json:"recogn_text,omitempty"` // ASR transcript, inbound only
+	// Media is the CDN reference to the voice file.
+	Media *CDNMedia
+
+	// EncodeType is the audio encoding; [VoiceEncodeSilk] is the most common.
+	EncodeType VoiceEncodeType
+	// BitsPerSample and SampleRate describe the audio format.
+	BitsPerSample int
+	SampleRate    int
+	// PlaytimeMs is the audio duration in milliseconds.
+	PlaytimeMs int
+	// RecognText is the ASR transcript (inbound only, may be empty).
+	RecognText string
+}
+
+// FileItem is a file attachment.
+type FileItem struct {
+	// Media is the CDN reference to the file.
+	Media *CDNMedia
+
+	// FileName is the original file name.
+	FileName string
+	// MD5 is the plaintext file MD5 (hex).
+	MD5 string
+	// Size is the plaintext file size in bytes.
+	Size int64
 }
 
 // VideoItem is a video message with an optional thumbnail.
 type VideoItem struct {
-	MediaItem
-	DurationMs int        `json:"duration_ms"`
-	Thumb      *MediaItem `json:"thumb_item,omitempty"`
+	// Media is the CDN reference to the video.
+	Media *CDNMedia
+	// ThumbMedia is the CDN reference to the thumbnail.
+	ThumbMedia *CDNMedia
+
+	// VideoSize is the plaintext video size in bytes.
+	VideoSize int
+	// PlayLengthMs is the video duration in milliseconds.
+	PlayLengthMs int
+	// VideoMD5 is the plaintext video MD5.
+	VideoMD5 string
+
+	ThumbSize   int
+	ThumbWidth  int
+	ThumbHeight int
+}
+
+// RefMessage represents a quoted / referenced message.
+type RefMessage struct {
+	// Item is the referenced message item.
+	Item *Item
+	// Title is a plaintext summary of the referenced content.
+	Title string
 }
 
 // Message is an inbound message received from a WeChat user.
 type Message struct {
+	// Seq is the message sequence number.
+	Seq int64
+	// MessageID is the unique message ID.
+	MessageID int64
+
 	// From is the sender's user ID (format: "xxx@im.wechat").
 	From string
 	// To is the bot's own user ID (format: "xxx@im.bot").
 	To string
 	// GroupID is set when the message was sent in a group chat.
 	GroupID string
+	// SessionID is the conversation session identifier.
+	SessionID string
+
+	// CreateTimeMs is the message creation timestamp in milliseconds.
+	CreateTimeMs int64
+	// UpdateTimeMs is the message last-update timestamp in milliseconds.
+	UpdateTimeMs int64
+
 	// ContextToken must be echoed back verbatim when replying, so WeChat
 	// associates the reply with the correct conversation window.
 	ContextToken string
+
 	// Items holds the message content elements in order.
 	Items []Item
 }

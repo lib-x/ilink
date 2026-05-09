@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"log/slog"
 	"os"
+	"os/signal"
 
 	"github.com/lib-x/ilink"
 )
 
-// ExampleStartLogin shows the QR code login flow and how to persist the token.
+// ExampleStartLogin shows how to perform a QR code login and persist the token.
 func ExampleStartLogin() {
 	ctx := context.Background()
 
@@ -19,29 +19,37 @@ func ExampleStartLogin() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	// Display the URL or encode login.QRCode as an image yourself.
-	fmt.Println("scan:", login.URL)
+	fmt.Println("Scan this URL with WeChat:", login.URL)
 
 	token, err := login.Wait(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Persist token for reuse across restarts.
+	// Persist token.BotToken for reuse across restarts.
 	data, _ := json.Marshal(token)
-	os.WriteFile("token.json", data, 0600)
-
-	_ = token
+	os.WriteFile("token.json", data, 0o600)
 }
 
-// ExampleClient_ListenAndServe shows the minimal message-loop setup.
+// ExampleClient_ListenAndServe shows the minimal echo-bot pattern.
 func ExampleClient_ListenAndServe() {
-	token := ilink.Token{BotToken: "your-bot-token"}
+	// Load a previously persisted token.
+	data, err := os.ReadFile("token.json")
+	if err != nil {
+		log.Fatal(err)
+	}
+	var token ilink.Token
+	if err := json.Unmarshal(data, &token); err != nil {
+		log.Fatal(err)
+	}
+
 	client := ilink.NewClient(token)
 
-	ctx := context.Background()
-	err := client.ListenAndServe(ctx, ilink.HandlerFunc(func(ctx context.Context, msg *ilink.Message) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	err = client.ListenAndServe(ctx, ilink.HandlerFunc(func(ctx context.Context, msg *ilink.Message) error {
+		log.Printf("message from %s: %s", msg.From, msg.Text())
 		return client.Reply(ctx, msg, ilink.TextMessage("pong"))
 	}))
 	if err != nil {
@@ -49,28 +57,13 @@ func ExampleClient_ListenAndServe() {
 	}
 }
 
-// ExampleClient_Reply shows how to reply to an inbound message.
-func ExampleClient_Reply() {
-	token := ilink.Token{BotToken: "your-bot-token"}
-	client := ilink.NewClient(token)
-
-	handler := ilink.HandlerFunc(func(ctx context.Context, msg *ilink.Message) error {
-		// Reply echoes context_token automatically.
-		return client.Reply(ctx, msg, ilink.TextMessage("你好！"))
-	})
-
-	_ = handler
-}
-
-// ExampleClient_Send shows how to send an outbound message directly.
+// ExampleClient_Send shows how to proactively send a message to a user.
 func ExampleClient_Send() {
-	token := ilink.Token{BotToken: "your-bot-token"}
-	client := ilink.NewClient(token)
+	client := ilink.NewClient(ilink.Token{BotToken: "…"})
 
-	ctx := context.Background()
-	err := client.Send(ctx, &ilink.OutboundMessage{
+	err := client.Send(context.Background(), &ilink.OutboundMessage{
 		To:           "o9cq800kum_xxx@im.wechat",
-		ContextToken: "<context_token from inbound message>",
+		ContextToken: "AARzJWAF…", // from a previous inbound message
 		Items:        []ilink.Item{ilink.TextMessage("Hello!")},
 	})
 	if err != nil {
@@ -78,42 +71,63 @@ func ExampleClient_Send() {
 	}
 }
 
-// ExampleClient_UploadMedia shows how to send an image.
+// ExampleClient_UploadMedia shows how to upload an image and send it.
 func ExampleClient_UploadMedia() {
-	token := ilink.Token{BotToken: "your-bot-token"}
-	client := ilink.NewClient(token,
-		ilink.WithLogger(slog.Default()),
-	)
-
+	client := ilink.NewClient(ilink.Token{BotToken: "…"})
 	ctx := context.Background()
+
 	data, err := os.ReadFile("photo.jpg")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	media, err := client.UploadMedia(ctx, data, &ilink.UploadOptions{FileName: "photo.jpg"})
+	media, err := client.UploadMedia(ctx, data, &ilink.UploadOptions{
+		FileName:  "photo.jpg",
+		MediaType: ilink.UploadMediaTypeImage,
+		ToUserID:  "o9cq800kum_xxx@im.wechat",
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Embed the uploaded MediaItem in an outbound message.
+	// Send the uploaded image in a message.
 	err = client.Send(ctx, &ilink.OutboundMessage{
 		To:           "o9cq800kum_xxx@im.wechat",
-		ContextToken: "<context_token>",
-		Items:        []ilink.Item{{Type: ilink.ItemTypeImage, Image: media}},
+		ContextToken: "AARzJWAF…",
+		Items: []ilink.Item{
+			{
+				Type:  ilink.ItemTypeImage,
+				Image: &ilink.ImageItem{Media: media},
+			},
+		},
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-// ExampleNewClient_options shows available client options.
-func ExampleNewClient_options() {
-	token := ilink.Token{BotToken: "your-bot-token"}
+// ExampleDecryptMedia shows how to decrypt a received media file.
+func ExampleDecryptMedia() {
+	// Assume msg is an inbound *ilink.Message containing an image.
+	var msg *ilink.Message
 
-	client := ilink.NewClient(token,
-		ilink.WithLogger(slog.Default()),
-	)
-
-	_ = client
+	for _, item := range msg.Items {
+		if item.Type != ilink.ItemTypeImage || item.Image == nil {
+			continue
+		}
+		img := item.Image
+		if img.Media == nil {
+			continue
+		}
+		// Use FullURL if available, otherwise construct from EncryptQueryParam.
+		cdnURL := img.Media.FullURL
+		if cdnURL == "" {
+			cdnURL = "https://novac2c.cdn.weixin.qq.com/c2c?" + img.Media.EncryptQueryParam
+		}
+		plain, err := ilink.DownloadAndDecrypt(context.Background(), cdnURL, img.Media)
+		if err != nil {
+			log.Fatal(err)
+		}
+		os.WriteFile("received.jpg", plain, 0o644)
+	}
 }

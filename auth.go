@@ -32,9 +32,9 @@ type Login struct {
 // Display Login.URL or encode Login.QRCode as an image, then call [Login.Wait].
 func StartLogin(ctx context.Context) (*Login, error) {
 	var resp struct {
-		Ret             int    `json:"ret"`
-		QRCode          string `json:"qrcode"`
-		QRCodeImgURL    string `json:"qrcode_img_content"`
+		Ret          int    `json:"ret"`
+		QRCode       string `json:"qrcode"`
+		QRCodeImgURL string `json:"qrcode_img_content"`
 	}
 	if err := getJSON(ctx, defaultBase, "/ilink/bot/get_bot_qrcode?bot_type=3", nil, &resp); err != nil {
 		return nil, fmt.Errorf("ilink: StartLogin: %w", err)
@@ -57,7 +57,6 @@ func StartLogin(ctx context.Context) (*Login, error) {
 // immediately when the status changes.
 func (l *Login) Wait(ctx context.Context) (*Token, error) {
 	url := "/ilink/bot/get_qrcode_status?qrcode=" + l.qrcode
-
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 

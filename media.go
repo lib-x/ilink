@@ -13,25 +13,56 @@ import (
 	"net/http"
 )
 
-// UploadOptions configures an [Client.UploadMedia] call.
+// UploadMediaType constants mirror UploadMediaType from upstream types.ts.
+const (
+	UploadMediaTypeImage = 1
+	UploadMediaTypeVideo = 2
+	UploadMediaTypeFile  = 3
+	UploadMediaTypeVoice = 4
+)
+
+// UploadOptions configures a [Client.UploadMedia] call.
 type UploadOptions struct {
 	// FileName is embedded in the CDN reference for file-type attachments.
 	FileName string
-	// ThumbData is raw thumbnail bytes for image or video uploads.
+
+	// MediaType selects the upload slot: use the UploadMediaType* constants.
+	// Defaults to UploadMediaTypeImage when zero.
+	MediaType int
+
+	// ToUserID is the target recipient's user ID. Required for routing when
+	// the server needs it to resolve the CDN bucket.
+	ToUserID string
+
+	// ThumbData is raw thumbnail bytes for IMAGE or VIDEO uploads.
 	// When set, a separate CDN slot is allocated for the thumbnail.
 	ThumbData []byte
+
+	// NoThumb suppresses thumbnail allocation even when ThumbData is empty.
+	NoThumb bool
 }
 
 // UploadMedia encrypts data with a fresh AES-128 key, uploads the ciphertext
-// to Tencent CDN, and returns a [MediaItem] ready to embed in an [Item].
+// to Tencent CDN, and returns a [CDNMedia] ready to embed in an [Item].
 //
 //	data, _ := os.ReadFile("photo.jpg")
-//	media, err := client.UploadMedia(ctx, data, &ilink.UploadOptions{FileName: "photo.jpg"})
+//	media, err := client.UploadMedia(ctx, data, &ilink.UploadOptions{
+//	    FileName:  "photo.jpg",
+//	    MediaType: ilink.UploadMediaTypeImage,
+//	    ToUserID:  msg.From,
+//	})
 //	if err != nil { ... }
-//	err = client.Reply(ctx, msg, ilink.Item{Type: ilink.ItemTypeImage, Image: media})
-func (c *Client) UploadMedia(ctx context.Context, data []byte, opts *UploadOptions) (*MediaItem, error) {
+//	err = client.Reply(ctx, msg, ilink.Item{
+//	    Type:  ilink.ItemTypeImage,
+//	    Image: &ilink.ImageItem{Media: media},
+//	})
+func (c *Client) UploadMedia(ctx context.Context, data []byte, opts *UploadOptions) (*CDNMedia, error) {
 	if opts == nil {
 		opts = &UploadOptions{}
+	}
+	mediaType := opts.MediaType
+	if mediaType == 0 {
+		mediaType = UploadMediaTypeImage
 	}
 
 	// 1. Generate a random 128-bit AES key.
@@ -46,7 +77,9 @@ func (c *Client) UploadMedia(ctx context.Context, data []byte, opts *UploadOptio
 		return nil, fmt.Errorf("ilink: UploadMedia: encrypt: %w", err)
 	}
 
-	plainMD5, encSize, plainSize := md5hex(data), int64(len(enc)), int64(len(data))
+	plainMD5 := md5hex(data)
+	plainSize := int64(len(data))
+	encSize := int64(len(enc))
 
 	// 3. Optionally encrypt thumbnail.
 	var thumbEnc []byte
@@ -59,24 +92,31 @@ func (c *Client) UploadMedia(ctx context.Context, data []byte, opts *UploadOptio
 		thumbMD5 = md5hex(opts.ThumbData)
 	}
 
-	// 4. Get pre-signed CDN URLs.
+	// 4. Get pre-signed CDN upload parameters (new field names from types.ts v2).
 	urlReq := map[string]any{
-		"file_size":      plainSize,
-		"file_md5":       plainMD5,
-		"encrypted_size": encSize,
+		"media_type":   mediaType,
+		"to_user_id":   opts.ToUserID,
+		"rawsize":      plainSize,
+		"rawfilemd5":   plainMD5,
+		"filesize":     encSize,
+		"aeskey":       base64.StdEncoding.EncodeToString(aesKey),
+	}
+	if opts.FileName != "" {
+		urlReq["filekey"] = opts.FileName
 	}
 	if thumbEnc != nil {
-		urlReq["thumb_file_size"] = int64(len(opts.ThumbData))
-		urlReq["thumb_file_md5"] = thumbMD5
-		urlReq["thumb_encrypted_size"] = int64(len(thumbEnc))
+		urlReq["thumb_rawsize"] = int64(len(opts.ThumbData))
+		urlReq["thumb_rawfilemd5"] = thumbMD5
+		urlReq["thumb_filesize"] = int64(len(thumbEnc))
+	} else if opts.NoThumb {
+		urlReq["no_need_thumb"] = true
 	}
 
 	var urlResp struct {
-		Ret               int    `json:"ret"`
-		UploadURL         string `json:"upload_url"`
-		EncryptQueryParam string `json:"encrypt_query_param"`
-		ThumbUploadURL    string `json:"thumb_upload_url,omitempty"`
-		ThumbEncryptQuery string `json:"thumb_encrypt_query_param,omitempty"`
+		Ret            int    `json:"ret"`
+		UploadParam    string `json:"upload_param"`
+		ThumbUploadParam string `json:"thumb_upload_param,omitempty"`
+		UploadFullURL  string `json:"upload_full_url,omitempty"`
 	}
 	if err := c.postJSON(ctx, "/ilink/bot/getuploadurl", urlReq, &urlResp); err != nil {
 		return nil, fmt.Errorf("ilink: UploadMedia: getuploadurl: %w", err)
@@ -86,36 +126,66 @@ func (c *Client) UploadMedia(ctx context.Context, data []byte, opts *UploadOptio
 	}
 
 	// 5. PUT encrypted bytes to CDN.
-	if err := putBytes(ctx, urlResp.UploadURL, enc); err != nil {
+	uploadURL := urlResp.UploadFullURL
+	if uploadURL == "" {
+		uploadURL = urlResp.UploadParam
+	}
+	if err := putBytes(ctx, uploadURL, enc); err != nil {
 		return nil, fmt.Errorf("ilink: UploadMedia: upload: %w", err)
 	}
-	if thumbEnc != nil && urlResp.ThumbUploadURL != "" {
-		if err := putBytes(ctx, urlResp.ThumbUploadURL, thumbEnc); err != nil {
+	if thumbEnc != nil {
+		thumbURL := urlResp.ThumbUploadParam
+		if thumbURL == "" {
+			return nil, fmt.Errorf("ilink: UploadMedia: server did not return thumb_upload_param")
+		}
+		if err := putBytes(ctx, thumbURL, thumbEnc); err != nil {
 			return nil, fmt.Errorf("ilink: UploadMedia: upload thumb: %w", err)
 		}
 	}
 
-	return &MediaItem{
-		FileName:          opts.FileName,
-		FileSize:          plainSize,
-		FileMD5:           plainMD5,
-		EncryptedSize:     encSize,
+	return &CDNMedia{
+		EncryptQueryParam: urlResp.UploadParam,
 		AESKey:            base64.StdEncoding.EncodeToString(aesKey),
-		EncryptQueryParam: urlResp.EncryptQueryParam,
+		FullURL:           urlResp.UploadFullURL,
 	}, nil
 }
 
 // DecryptMedia decrypts a CDN-downloaded encrypted blob using the AES key
-// stored in the [MediaItem]. Use this to read images/files received from users.
+// stored in the [CDNMedia]. Use this to read images/files received from users.
 //
-//	data, _ := downloadCDN(msg.Items[0].Image)
-//	plain, err := ilink.DecryptMedia(msg.Items[0].Image, data)
-func DecryptMedia(item *MediaItem, ciphertext []byte) ([]byte, error) {
+//	data, _ := ilink.DownloadAndDecrypt(ctx, cdnURL, msg.Items[0].Image.Media)
+//	// or, if you downloaded the bytes yourself:
+//	plain, err := ilink.DecryptMedia(msg.Items[0].Image.Media, ciphertext)
+func DecryptMedia(item *CDNMedia, ciphertext []byte) ([]byte, error) {
 	aesKey, err := base64.StdEncoding.DecodeString(item.AESKey)
 	if err != nil {
 		return nil, fmt.Errorf("ilink: DecryptMedia: decode key: %w", err)
 	}
 	return decryptECB(aesKey, ciphertext)
+}
+
+// DownloadAndDecrypt is a convenience function that fetches ciphertext from a
+// CDN URL and decrypts it using the key stored in item.
+//
+// When item.FullURL is populated the caller may use it directly; otherwise
+// construct the URL from item.EncryptQueryParam and the CDN base:
+//
+//	https://novac2c.cdn.weixin.qq.com/c2c?<EncryptQueryParam>
+func DownloadAndDecrypt(ctx context.Context, cdnURL string, item *CDNMedia) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cdnURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ilink: DownloadAndDecrypt: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("ilink: DownloadAndDecrypt: fetch: %w", err)
+	}
+	defer resp.Body.Close()
+	enc, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("ilink: DownloadAndDecrypt: read: %w", err)
+	}
+	return DecryptMedia(item, enc)
 }
 
 // ---- AES-128-ECB helpers ----
@@ -173,27 +243,4 @@ func md5hex(b []byte) string {
 	h := md5.New()
 	h.Write(b)
 	return hex.EncodeToString(h.Sum(nil))
-}
-
-// DownloadAndDecrypt is a convenience function that fetches ciphertext from a
-// CDN URL and decrypts it using the key stored in item.
-//
-// The caller is responsible for constructing the full CDN URL from the
-// EncryptQueryParam field (the scheme and host are
-// https://novac2c.cdn.weixin.qq.com/c2c).
-func DownloadAndDecrypt(ctx context.Context, cdnURL string, item *MediaItem) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cdnURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("ilink: DownloadAndDecrypt: %w", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("ilink: DownloadAndDecrypt: fetch: %w", err)
-	}
-	defer resp.Body.Close()
-	enc, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("ilink: DownloadAndDecrypt: read: %w", err)
-	}
-	return DecryptMedia(item, enc)
 }

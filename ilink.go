@@ -58,6 +58,11 @@ var (
 	// ErrLoginTimeout is returned by Login.Wait when the context deadline is
 	// exceeded before the user confirms the scan.
 	ErrLoginTimeout = errors.New("ilink: timed out waiting for QR code confirmation")
+
+	// ErrSessionTimeout is returned by ListenAndServe when the server reports
+	// errcode=-14, indicating the bot session has expired and re-login is
+	// required.
+	ErrSessionTimeout = errors.New("ilink: session timeout (re-login required)")
 )
 
 // APIError represents a non-zero ret code returned by the iLink API.

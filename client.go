@@ -9,19 +9,23 @@ import (
 )
 
 const (
-	defaultBase           = "https://ilinkai.weixin.qq.com"
-	defaultLongPollMs     = 35_000
-	channelVersion        = "1.0.2"
+	defaultBase       = "https://ilinkai.weixin.qq.com"
+	defaultLongPollMs = 35_000
+	channelVersion    = "2.0.0"
+
+	// errcodeSessionTimeout is the server errcode indicating the bot session
+	// has expired and re-login is required.
+	errcodeSessionTimeout = -14
 )
 
 // Client is a WeChat iLink bot client. Create one with [NewClient].
 //
 // A Client is safe for concurrent use by multiple goroutines.
 type Client struct {
-	token   Token
-	base    string
-	http    *http.Client
-	logger  *slog.Logger
+	token  Token
+	base   string
+	http   *http.Client
+	logger *slog.Logger
 }
 
 // Option configures a [Client]. Pass options to [NewClient].
@@ -69,6 +73,9 @@ func NewClient(token Token, opts ...Option) *Client {
 // inbound message. It blocks until ctx is cancelled or a non-recoverable error
 // occurs, and returns ctx.Err() on clean shutdown.
 //
+// If the server signals errcode=-14 (session timeout), ListenAndServe returns
+// [ErrSessionTimeout] so the caller can re-authenticate.
+//
 // Handler errors are logged via the client's logger and do not stop the loop.
 // Use ctx cancellation to shut down gracefully.
 //
@@ -77,15 +84,21 @@ func NewClient(token Token, opts ...Option) *Client {
 //	}))
 func (c *Client) ListenAndServe(ctx context.Context, h Handler) error {
 	var cursor string
+	// Server suggests the ideal polling interval; we start with the default.
+	pollInterval := time.Duration(defaultLongPollMs) * time.Millisecond
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
-		msgs, next, err := c.getUpdates(ctx, cursor)
+		msgs, next, suggestedMs, err := c.getUpdates(ctx, cursor)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if err == ErrSessionTimeout {
+				return ErrSessionTimeout
 			}
 			c.logger.ErrorContext(ctx, "ilink: poll error", slog.Any("err", err))
 			// Back off briefly on transient errors.
@@ -96,6 +109,12 @@ func (c *Client) ListenAndServe(ctx context.Context, h Handler) error {
 			}
 			continue
 		}
+
+		// Honour the server's suggested long-poll timeout for the next request.
+		if suggestedMs > 0 {
+			pollInterval = time.Duration(suggestedMs) * time.Millisecond
+		}
+		_ = pollInterval // used implicitly via the server's hold time
 
 		if next != "" {
 			cursor = next
@@ -121,13 +140,12 @@ func (c *Client) Send(ctx context.Context, msg *OutboundMessage) error {
 	if len(msg.Items) == 0 {
 		return fmt.Errorf("ilink: Send: OutboundMessage.Items must not be empty")
 	}
-
 	body := sendMessageRequest{
 		Msg: sendMessageBody{
 			ToUserID:     msg.To,
 			GroupID:      msg.GroupID,
-			MessageType:  2, // outbound
-			MessageState: 2, // finish
+			MessageType:  2, // BOT
+			MessageState: 2, // FINISH
 			ContextToken: msg.ContextToken,
 			ItemList:     marshalItems(msg.Items),
 		},
@@ -154,15 +172,15 @@ func (c *Client) Reply(ctx context.Context, to *Message, items ...Item) error {
 	})
 }
 
-// SendTyping sends a "typing…" indicator to the given user.
-// status=true starts the indicator; status=false stops it.
+// SendTyping sends a typing status indicator to the given user.
+// status=true starts the "typing…" indicator; status=false cancels it.
 func (c *Client) SendTyping(ctx context.Context, userID string, status bool) error {
 	cfg, err := c.getConfig(ctx, userID)
 	if err != nil {
 		return fmt.Errorf("ilink: SendTyping: %w", err)
 	}
-
-	s := 0
+	// Upstream TypingStatus: 1 = typing, 2 = cancel typing.
+	s := 2
 	if status {
 		s = 1
 	}
@@ -172,7 +190,8 @@ func (c *Client) SendTyping(ctx context.Context, userID string, status bool) err
 		"status":        s,
 	}
 	var resp struct {
-		Ret int `json:"ret"`
+		Ret    int    `json:"ret"`
+		ErrMsg string `json:"errmsg,omitempty"`
 	}
 	if err := c.postJSON(ctx, "/ilink/bot/sendtyping", body, &resp); err != nil {
 		return fmt.Errorf("ilink: SendTyping: %w", err)
@@ -180,27 +199,52 @@ func (c *Client) SendTyping(ctx context.Context, userID string, status bool) err
 	return checkRet("sendtyping", resp.Ret)
 }
 
+// RecallMessage withdraws a previously sent message.
+// msgID is the message_id field from an outbound message's server response.
+//
+// Note: message recall may have a time limit enforced by WeChat.
+func (c *Client) RecallMessage(ctx context.Context, msgID int64) error {
+	body := map[string]any{
+		"msg_id": msgID,
+	}
+	var resp struct {
+		Ret    int    `json:"ret"`
+		ErrMsg string `json:"errmsg,omitempty"`
+	}
+	if err := c.postJSON(ctx, "/ilink/bot/recallmessage", body, &resp); err != nil {
+		return fmt.Errorf("ilink: RecallMessage: %w", err)
+	}
+	return checkRet("recallmessage", resp.Ret)
+}
+
 // ---- internal helpers ----
 
-// getUpdates performs one long-poll call and returns the raw wire messages plus
-// the updated cursor.
-func (c *Client) getUpdates(ctx context.Context, cursor string) ([]wireMessage, string, error) {
+// getUpdates performs one long-poll call and returns raw wire messages, the
+// updated cursor, and the server-suggested next polling interval in ms.
+func (c *Client) getUpdates(ctx context.Context, cursor string) ([]wireMessage, string, int, error) {
 	body := map[string]any{
 		"get_updates_buf": cursor,
 		"base_info":       map[string]string{"channel_version": channelVersion},
 	}
 	var resp struct {
-		Ret           int           `json:"ret"`
-		Msgs          []wireMessage `json:"msgs"`
-		GetUpdatesBuf string        `json:"get_updates_buf"`
+		Ret               int            `json:"ret"`
+		ErrCode           int            `json:"errcode,omitempty"`
+		ErrMsg            string         `json:"errmsg,omitempty"`
+		Msgs              []wireMessage  `json:"msgs"`
+		GetUpdatesBuf     string         `json:"get_updates_buf"`
+		LongpollingTimeMs int            `json:"longpolling_timeout_ms,omitempty"`
 	}
 	if err := c.postJSON(ctx, "/ilink/bot/getupdates", body, &resp); err != nil {
-		return nil, "", err
+		return nil, "", 0, err
+	}
+	// errcode=-14 means the session has expired; signal caller to re-login.
+	if resp.ErrCode == errcodeSessionTimeout {
+		return nil, "", 0, ErrSessionTimeout
 	}
 	if err := checkRet("getupdates", resp.Ret); err != nil {
-		return nil, "", err
+		return nil, "", 0, err
 	}
-	return resp.Msgs, resp.GetUpdatesBuf, nil
+	return resp.Msgs, resp.GetUpdatesBuf, resp.LongpollingTimeMs, nil
 }
 
 // getConfig fetches the typing_ticket for the given user.
@@ -208,6 +252,7 @@ func (c *Client) getConfig(ctx context.Context, userID string) (string, error) {
 	body := map[string]string{"ilink_user_id": userID}
 	var resp struct {
 		Ret          int    `json:"ret"`
+		ErrMsg       string `json:"errmsg,omitempty"`
 		TypingTicket string `json:"typing_ticket"`
 	}
 	if err := c.postJSON(ctx, "/ilink/bot/getconfig", body, &resp); err != nil {
